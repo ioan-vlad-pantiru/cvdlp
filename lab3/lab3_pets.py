@@ -1,10 +1,68 @@
+import logging
+import os
+import subprocess
+import time
+
 import torch
+
+
+def _default_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision.datasets import OxfordIIITPet
 from torchvision import transforms
 from torchvision.models import resnet18, ResNet18_Weights
+
+
+def _reset_wandb():
+    try:
+        subprocess.run(["pkill", "-f", "wandb-core"], capture_output=True, timeout=5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    time.sleep(0.5)
+    os.environ.pop("WANDB_SERVICE", None)
+    try:
+        import wandb.sdk.wandb_setup as _wandb_setup
+
+        _wandb_setup._WandbSetup._instance = None
+    except Exception:
+        pass
+
+
+def _wandb_init_experiment(
+    project,
+    config,
+    name=None,
+    reset=True,
+    watch_model=False,
+    watch_log_freq=100,
+    model=None,
+):
+    import wandb
+
+    logging.getLogger("wandb").setLevel(logging.ERROR)
+    if reset:
+        _reset_wandb()
+    kwargs = dict(
+        project=project,
+        config=config,
+        reinit=True,
+        settings=wandb.Settings(silent=True),
+    )
+    if name is not None:
+        kwargs["name"] = name
+    run = wandb.init(**kwargs)
+    wandb.define_metric("epoch")
+    wandb.define_metric("*", step_metric="epoch")
+    if watch_model and model is not None:
+        wandb.watch(model, log="all", log_freq=watch_log_freq)
+    return run
 
 
 def get_dataloaders(
@@ -121,21 +179,28 @@ def evaluate(model, loader, criterion, device):
 
 
 def train_simple_cnn(
-    epochs=5,
+    epochs=15,
     lr=0.01,
     device=None,
     use_scheduler=True,
     use_wandb=False,
     max_train_samples=2000,
+    weight_decay=0.0,
+    wandb_reset=True,
+    wandb_finish=True,
+    wandb_watch=False,
+    wandb_run_name=None,
 ):
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = _default_device()
     train_loader, test_loader, num_classes = get_dataloaders(
         max_train_samples=max_train_samples
     )
     model = SimpleCNN(num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay
+    )
     scheduler = (
         torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
         if use_scheduler
@@ -145,8 +210,27 @@ def train_simple_cnn(
     if use_wandb:
         import wandb
 
-        wandb.init(project="lab3-oxford-pets", config={"lr": lr, "epochs": epochs})
-        wandb.watch(model, log="all", log_freq=100)
+        if wandb.run is None:
+            _wandb_init_experiment(
+                "lab3-oxford-pets",
+                dict(
+                    lr=lr,
+                    epochs=epochs,
+                    use_scheduler=use_scheduler,
+                    max_train_samples=max_train_samples,
+                    weight_decay=weight_decay,
+                    model="SimpleCNN",
+                ),
+                name=wandb_run_name,
+                reset=wandb_reset,
+                watch_model=wandb_watch,
+                model=model,
+            )
+        else:
+            wandb.define_metric("epoch")
+            wandb.define_metric("*", step_metric="epoch")
+            if wandb_watch:
+                wandb.watch(model, log="all", log_freq=100)
 
     history = {
         "train_loss": [],
@@ -171,13 +255,20 @@ def train_simple_cnn(
             wandb.log(
                 {
                     "epoch": ep,
-                    "train_loss": tr_loss,
-                    "test_loss": te_loss,
-                    "train_acc": tr_acc,
-                    "test_acc": te_acc,
+                    "train/loss": tr_loss,
+                    "test/loss": te_loss,
+                    "train/accuracy": tr_acc,
+                    "test/accuracy": te_acc,
                     "lr": optimizer.param_groups[0]["lr"],
-                }
+                },
+                step=ep,
             )
+
+    if use_wandb and wandb_finish:
+        import wandb
+
+        wandb.finish()
+
     return model, history
 
 
@@ -204,16 +295,21 @@ def build_resnet18_finetune(num_classes=37, freeze_policy="last_block"):
 
 
 def finetune_train(
-    epochs=5,
+    epochs=15,
     lr_head=0.01,
     lr_backbone=0.001,
     freeze_policy="last_block",
     device=None,
     use_wandb=False,
     max_train_samples=None,
+    weight_decay=0.0,
+    wandb_reset=True,
+    wandb_finish=True,
+    wandb_watch=False,
+    wandb_run_name=None,
 ):
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = _default_device()
     train_loader, test_loader, num_classes = get_dataloaders(
         max_train_samples=max_train_samples
     )
@@ -228,21 +324,34 @@ def finetune_train(
     if backbone_params:
         param_groups.append({"params": backbone_params, "lr": lr_backbone})
     param_groups.append({"params": head_params, "lr": lr_head})
-    optimizer = torch.optim.SGD(param_groups, momentum=0.9)
+    optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
 
     if use_wandb:
         import wandb
 
-        wandb.init(
-            project="lab3-finetune",
-            config=dict(
-                lr_head=lr_head,
-                lr_backbone=lr_backbone,
-                freeze_policy=freeze_policy,
-                epochs=epochs,
-            ),
-        )
+        if wandb.run is None:
+            _wandb_init_experiment(
+                "lab3-oxford-pets",
+                dict(
+                    lr_head=lr_head,
+                    lr_backbone=lr_backbone,
+                    freeze_policy=freeze_policy,
+                    epochs=epochs,
+                    max_train_samples=max_train_samples,
+                    weight_decay=weight_decay,
+                    model="resnet18_finetune",
+                ),
+                name=wandb_run_name,
+                reset=wandb_reset,
+                watch_model=wandb_watch,
+                model=model,
+            )
+        else:
+            wandb.define_metric("epoch")
+            wandb.define_metric("*", step_metric="epoch")
+            if wandb_watch:
+                wandb.watch(model, log="all", log_freq=100)
 
     history = {"train_loss": [], "test_loss": [], "train_acc": [], "test_acc": []}
     for ep in range(epochs):
@@ -258,15 +367,23 @@ def finetune_train(
         if use_wandb:
             import wandb
 
-            wandb.log(
-                {
-                    "epoch": ep,
-                    "train_loss": tr_loss,
-                    "test_loss": te_loss,
-                    "train_acc": tr_acc,
-                    "test_acc": te_acc,
-                }
-            )
+            log_payload = {
+                "epoch": ep,
+                "train/loss": tr_loss,
+                "test/loss": te_loss,
+                "train/accuracy": tr_acc,
+                "test/accuracy": te_acc,
+                "lr_head": optimizer.param_groups[-1]["lr"],
+            }
+            if len(optimizer.param_groups) > 1:
+                log_payload["lr_backbone"] = optimizer.param_groups[0]["lr"]
+            wandb.log(log_payload, step=ep)
+
+    if use_wandb and wandb_finish:
+        import wandb
+
+        wandb.finish()
+
     return model, history
 
 
@@ -408,24 +525,52 @@ def top_k_activation_patches(
     return patches
 
 
-def run_wandb_sweep_train_fn():
+def log_wandb_summary_table(rows, project="lab3-oxford-pets", run_name="summary-table"):
     import wandb
 
+    if not rows:
+        return
+    logging.getLogger("wandb").setLevel(logging.ERROR)
+    _reset_wandb()
+    summary_run = wandb.init(
+        project=project,
+        name=run_name,
+        reinit=True,
+        settings=wandb.Settings(silent=True),
+    )
+    cols = list(rows[0].keys())
+    table = wandb.Table(columns=cols)
+    for r in rows:
+        table.add_data(*[r[c] for c in cols])
+    wandb.log({"results": table})
+    summary_run.finish()
+
+
+def run_wandb_sweep_train_fn():
     def train():
-        wandb.init()
-        lr_head = wandb.config.lr_head
-        lr_backbone = wandb.config.lr_backbone
-        freeze_policy = wandb.config.get("freeze_policy", "last_block")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model, history = finetune_train(
-            epochs=wandb.config.epochs,
-            lr_head=lr_head,
-            lr_backbone=lr_backbone,
-            freeze_policy=freeze_policy,
+        import wandb
+
+        c = wandb.config
+        device = _default_device()
+        freeze_policy = getattr(c, "freeze_policy", "last_block")
+        max_samples = getattr(c, "max_train_samples", None)
+        wd = float(getattr(c, "weight_decay", 0.0))
+        watch = bool(getattr(c, "wandb_watch", False))
+        _, history = finetune_train(
+            epochs=int(c.epochs),
+            lr_head=float(c.lr_head),
+            lr_backbone=float(c.lr_backbone),
+            freeze_policy=str(freeze_policy),
             device=device,
             use_wandb=True,
-            max_train_samples=wandb.config.get("max_train_samples"),
+            max_train_samples=max_samples,
+            weight_decay=wd,
+            wandb_reset=False,
+            wandb_finish=True,
+            wandb_watch=watch,
         )
-        return model, history
+        te = history["test_acc"][-1]
+        wandb.summary["final_test_accuracy"] = te
+        return history
 
     return train

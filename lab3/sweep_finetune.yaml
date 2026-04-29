@@ -1,0 +1,25 @@
+# Hyperparameters for fine-tuning (Oxford-IIIT Pet).
+# Load in Python and start the sweep — no separate training script required:
+#
+#   import wandb, yaml
+#   from pathlib import Path
+#   cfg = yaml.safe_load(Path("sweep_finetune.yaml").read_text())
+#   sweep_id = wandb.sweep(cfg, project="lab3-oxford-pets")
+#   train = lab3_pets.run_wandb_sweep_train_fn()
+#   wandb.agent(sweep_id, function=train, count=10)
+#
+method: random
+metric:
+  name: final_test_accuracy
+  goal: maximize
+parameters:
+  epochs:
+    values: [10, 15]
+  lr_head:
+    values: [0.001, 0.01, 0.02]
+  lr_backbone:
+    values: [0.0001, 0.0003, 0.001]
+  freeze_policy:
+    values: ["head_only", "last_block", "all"]
+  weight_decay:
+    values: [0.0, 0.0001]
