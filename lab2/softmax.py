@@ -52,9 +52,11 @@ class SoftmaxClassifier:
         X_b = self._add_bias_column(X_train)
 
         for _ in range(epochs):
+            perm = torch.randperm(N)
             for ii in range((N - 1) // batch_size + 1):
-                xb = X_b[ii * batch_size: (ii + 1) * batch_size]
-                yb = y_train[ii * batch_size: (ii + 1) * batch_size]
+                idx = perm[ii * batch_size: (ii + 1) * batch_size]
+                xb = X_b[idx]
+                yb = y_train[idx]
 
                 scores = xb @ self.W
                 log_probs = self._log_softmax(scores)
