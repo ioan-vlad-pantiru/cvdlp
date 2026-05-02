@@ -37,7 +37,11 @@ cifar-10-batches-py/
 lab*/data/
 *.tar.gz
 *.tar.bz2
+*.tgz
 *.zip
+
+# LFW dataset
+lab4/lfw_dataset/
 
 # Notebook assets fetched locally
 cameraman.jpg
