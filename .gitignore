@@ -45,6 +45,17 @@ lab4/lfw_dataset/
 
 # Notebook assets fetched locally
 cameraman.jpg
+cameraman.jpg.*
+
+# Lab 6 – generated assets & large files
+lab6/dataset/
+lab6/synthetic/
+lab6/progetto-finale-flowes/
+lab6/flowes.tar.gz
+lab6/rf-detr-base.pth
+lab6/yolo12n.pt
+lab6/yolo26n.pt
+lab6/data.yaml
 
 # Saved model weights & checkpoints
 *.pt
@@ -70,3 +81,5 @@ mlruns/
 .idea/
 .vscode/
 *.swp
+
+*/ELFW2

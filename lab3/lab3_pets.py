@@ -19,6 +19,14 @@ from torchvision.datasets import OxfordIIITPet
 from torchvision import transforms
 from torchvision.models import resnet18, ResNet18_Weights
 
+# ImageNet normalization stats (used for pretrained ResNet18)
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+# Generic normalization for scratch training
+_GENERIC_MEAN = (0.5, 0.5, 0.5)
+_GENERIC_STD  = (0.5, 0.5, 0.5)
+
 
 def _reset_wandb():
     try:
@@ -72,24 +80,47 @@ def get_dataloaders(
     train_fraction=0.85,
     num_workers=0,
     max_train_samples=None,
+    use_imagenet_norm=False,
+    strong_augment=False,
 ):
-    t_train = transforms.Compose(
+    """
+    use_imagenet_norm: set True when feeding a pretrained ResNet18
+    strong_augment: enables RandomResizedCrop + ColorJitter on train split
+    """
+    mean = _IMAGENET_MEAN if use_imagenet_norm else _GENERIC_MEAN
+    std  = _IMAGENET_STD  if use_imagenet_norm else _GENERIC_STD
+
+    if strong_augment:
+        train_tf = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+                transforms.RandomRotation(10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+    else:
+        train_tf = transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
+
+    test_tf = transforms.Compose(
         [
             transforms.Resize((img_size, img_size)),
-            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            transforms.Normalize(mean, std),
         ]
     )
-    t_test = transforms.Compose(
-        [
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-        ]
-    )
+
     full = OxfordIIITPet(
-        root, split="trainval", target_types="category", download=True, transform=t_train
+        root, split="trainval", target_types="category", download=True, transform=train_tf
     )
     n = len(full)
     g = torch.Generator().manual_seed(42)
@@ -102,7 +133,7 @@ def get_dataloaders(
 
     train_set = Subset(full, train_idx)
     test_full = OxfordIIITPet(
-        root, split="trainval", target_types="category", download=True, transform=t_test
+        root, split="trainval", target_types="category", download=True, transform=test_tf
     )
     test_set = Subset(test_full, test_idx)
     train_loader = DataLoader(
@@ -116,33 +147,70 @@ def get_dataloaders(
 
 
 class SimpleCNN(nn.Module):
-    def __init__(self, num_classes=37):
+    """3-block CNN with BatchNorm and Dropout for better generalisation."""
+
+    def __init__(self, num_classes=37, dropout=0.4):
         super().__init__()
         self.features = nn.Sequential(
+            # Block 1: 3 → 32
             nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
+
+            # Block 2: 32 → 64
             nn.Conv2d(32, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
+
+            # Block 3: 64 → 128
             nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
+
+            # Block 4: 128 → 256
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((4, 4)),
         )
-        self.fc = nn.Linear(128 * 4 * 4, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(256 * 4 * 4, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, num_classes),
+        )
 
     def forward(self, x):
         x = self.features(x)
         x = torch.flatten(x, 1)
-        return self.fc(x)
+        return self.classifier(x)
 
 
 def accuracy(logits, y):
     return (logits.argmax(dim=1) == y).float().mean().item()
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def _build_optimizer(params_or_groups, optimizer_type, lr, momentum, weight_decay):
+    if optimizer_type == "adamw":
+        return torch.optim.AdamW(params_or_groups, lr=lr, weight_decay=weight_decay)
+    return torch.optim.SGD(
+        params_or_groups, lr=lr, momentum=momentum, weight_decay=weight_decay
+    )
+
+
+def _build_scheduler(optimizer, scheduler_type, epochs):
+    if scheduler_type == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    if scheduler_type == "exp":
+        return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+    return None
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device, grad_clip=None):
     model.train()
     total_loss = 0.0
     total_acc = 0.0
@@ -153,6 +221,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
+        if grad_clip is not None:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         bs = x.size(0)
         total_loss += loss.item() * bs
@@ -183,9 +253,15 @@ def train_simple_cnn(
     lr=0.01,
     device=None,
     use_scheduler=True,
+    scheduler_type="cosine",
+    optimizer_type="sgd",
+    label_smoothing=0.1,
+    dropout=0.4,
+    grad_clip=5.0,
     use_wandb=False,
     max_train_samples=2000,
-    weight_decay=0.0,
+    weight_decay=1e-4,
+    strong_augment=True,
     wandb_reset=True,
     wandb_finish=True,
     wandb_watch=False,
@@ -194,18 +270,15 @@ def train_simple_cnn(
     if device is None:
         device = _default_device()
     train_loader, test_loader, num_classes = get_dataloaders(
-        max_train_samples=max_train_samples
+        max_train_samples=max_train_samples,
+        strong_augment=strong_augment,
     )
-    model = SimpleCNN(num_classes).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay
+    model = SimpleCNN(num_classes, dropout=dropout).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    optimizer = _build_optimizer(
+        model.parameters(), optimizer_type, lr, momentum=0.9, weight_decay=weight_decay
     )
-    scheduler = (
-        torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
-        if use_scheduler
-        else None
-    )
+    scheduler = _build_scheduler(optimizer, scheduler_type, epochs) if use_scheduler else None
 
     if use_wandb:
         import wandb
@@ -216,7 +289,11 @@ def train_simple_cnn(
                 dict(
                     lr=lr,
                     epochs=epochs,
-                    use_scheduler=use_scheduler,
+                    scheduler_type=scheduler_type,
+                    optimizer_type=optimizer_type,
+                    label_smoothing=label_smoothing,
+                    dropout=dropout,
+                    strong_augment=strong_augment,
                     max_train_samples=max_train_samples,
                     weight_decay=weight_decay,
                     model="SimpleCNN",
@@ -240,7 +317,7 @@ def train_simple_cnn(
     }
     for ep in range(epochs):
         tr_loss, tr_acc = train_one_epoch(
-            model, train_loader, optimizer, criterion, device
+            model, train_loader, optimizer, criterion, device, grad_clip=grad_clip
         )
         te_loss, te_acc = evaluate(model, test_loader, criterion, device)
         history["train_loss"].append(tr_loss)
@@ -254,14 +331,13 @@ def train_simple_cnn(
 
             wandb.log(
                 {
-                    "epoch": ep,
+                    "epoch": ep + 1,
                     "train/loss": tr_loss,
                     "test/loss": te_loss,
                     "train/accuracy": tr_acc,
                     "test/accuracy": te_acc,
                     "lr": optimizer.param_groups[0]["lr"],
-                },
-                step=ep,
+                }
             )
 
     if use_wandb and wandb_finish:
@@ -282,13 +358,22 @@ def build_resnet18_finetune(num_classes=37, freeze_policy="last_block"):
     elif freeze_policy == "last_block":
         for p in model.layer4.parameters():
             p.requires_grad = True
+    elif freeze_policy == "two_blocks":
+        for p in model.layer3.parameters():
+            p.requires_grad = True
+        for p in model.layer4.parameters():
+            p.requires_grad = True
     elif freeze_policy == "all":
         for p in model.parameters():
             p.requires_grad = True
     else:
         raise ValueError(freeze_policy)
     in_f = model.fc.in_features
-    model.fc = nn.Linear(in_f, num_classes)
+    # Two-layer head with Dropout for better generalisation
+    model.fc = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(in_f, num_classes),
+    )
     for p in model.fc.parameters():
         p.requires_grad = True
     return model
@@ -299,10 +384,15 @@ def finetune_train(
     lr_head=0.01,
     lr_backbone=0.001,
     freeze_policy="last_block",
+    optimizer_type="sgd",
+    scheduler_type="cosine",
+    label_smoothing=0.1,
+    grad_clip=5.0,
     device=None,
     use_wandb=False,
     max_train_samples=None,
-    weight_decay=0.0,
+    weight_decay=1e-4,
+    strong_augment=True,
     wandb_reset=True,
     wandb_finish=True,
     wandb_watch=False,
@@ -310,22 +400,35 @@ def finetune_train(
 ):
     if device is None:
         device = _default_device()
+    # Use ImageNet normalization — critical for pretrained ResNet18
     train_loader, test_loader, num_classes = get_dataloaders(
-        max_train_samples=max_train_samples
+        max_train_samples=max_train_samples,
+        use_imagenet_norm=True,
+        strong_augment=strong_augment,
     )
     model = build_resnet18_finetune(num_classes, freeze_policy=freeze_policy).to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
     head_ids = {id(p) for p in model.fc.parameters()}
     backbone_params = [
         p for p in model.parameters() if p.requires_grad and id(p) not in head_ids
     ]
     head_params = list(model.fc.parameters())
-    param_groups = []
-    if backbone_params:
-        param_groups.append({"params": backbone_params, "lr": lr_backbone})
-    param_groups.append({"params": head_params, "lr": lr_head})
-    optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
+
+    if optimizer_type == "adamw":
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": lr_backbone})
+        param_groups.append({"params": head_params, "lr": lr_head})
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+    else:
+        param_groups = []
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": lr_backbone})
+        param_groups.append({"params": head_params, "lr": lr_head})
+        optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=weight_decay)
+
+    scheduler = _build_scheduler(optimizer, scheduler_type, epochs)
 
     if use_wandb:
         import wandb
@@ -337,6 +440,10 @@ def finetune_train(
                     lr_head=lr_head,
                     lr_backbone=lr_backbone,
                     freeze_policy=freeze_policy,
+                    optimizer_type=optimizer_type,
+                    scheduler_type=scheduler_type,
+                    label_smoothing=label_smoothing,
+                    strong_augment=strong_augment,
                     epochs=epochs,
                     max_train_samples=max_train_samples,
                     weight_decay=weight_decay,
@@ -356,19 +463,20 @@ def finetune_train(
     history = {"train_loss": [], "test_loss": [], "train_acc": [], "test_acc": []}
     for ep in range(epochs):
         tr_loss, tr_acc = train_one_epoch(
-            model, train_loader, optimizer, criterion, device
+            model, train_loader, optimizer, criterion, device, grad_clip=grad_clip
         )
         te_loss, te_acc = evaluate(model, test_loader, criterion, device)
         history["train_loss"].append(tr_loss)
         history["test_loss"].append(te_loss)
         history["train_acc"].append(tr_acc)
         history["test_acc"].append(te_acc)
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
         if use_wandb:
             import wandb
 
             log_payload = {
-                "epoch": ep,
+                "epoch": ep + 1,
                 "train/loss": tr_loss,
                 "test/loss": te_loss,
                 "train/accuracy": tr_acc,
@@ -377,7 +485,7 @@ def finetune_train(
             }
             if len(optimizer.param_groups) > 1:
                 log_payload["lr_backbone"] = optimizer.param_groups[0]["lr"]
-            wandb.log(log_payload, step=ep)
+            wandb.log(log_payload)
 
     if use_wandb and wandb_finish:
         import wandb
@@ -402,20 +510,22 @@ def extract_features(model, x, device):
 @torch.no_grad()
 def nearest_neighbors_demo(model, train_loader, query_img_chw, device, k=5):
     model.eval()
-    all_z, all_y = [], []
+    all_z, all_y, all_x = [], [], []
     for x, y in train_loader:
-        x = x.to(device)
         z = extract_features(model, x, device)
         all_z.append(z.cpu())
         all_y.append(y.clone())
+        all_x.append(x.cpu())
     Z = torch.cat(all_z, dim=0)
     Y = torch.cat(all_y, dim=0)
+    X = torch.cat(all_x, dim=0)
     q = extract_features(model, query_img_chw.unsqueeze(0), device).cpu()
     q = F.normalize(q, dim=1)
     Zn = F.normalize(Z, dim=1)
     sim = (Zn @ q.T).squeeze(1)
     top = torch.topk(sim, k=min(k, len(sim))).indices
-    return Y[top].tolist(), sim[top].tolist()
+    # return labels, similarities, and the actual neighbour images
+    return Y[top].tolist(), sim[top].tolist(), X[top]
 
 
 def grad_cam_resnet(model, image_chw, target_class, device):
@@ -538,10 +648,11 @@ def log_wandb_summary_table(rows, project="lab3-oxford-pets", run_name="summary-
         reinit=True,
         settings=wandb.Settings(silent=True),
     )
-    cols = list(rows[0].keys())
+    # Union of all keys so rows with different fields can coexist
+    cols = list(dict.fromkeys(k for r in rows for k in r))
     table = wandb.Table(columns=cols)
     for r in rows:
-        table.add_data(*[r[c] for c in cols])
+        table.add_data(*[r.get(c) for c in cols])
     wandb.log({"results": table})
     summary_run.finish()
 
@@ -550,27 +661,38 @@ def run_wandb_sweep_train_fn():
     def train():
         import wandb
 
+        wandb.init()  # must be called before wandb.config is readable
         c = wandb.config
         device = _default_device()
-        freeze_policy = getattr(c, "freeze_policy", "last_block")
-        max_samples = getattr(c, "max_train_samples", None)
-        wd = float(getattr(c, "weight_decay", 0.0))
-        watch = bool(getattr(c, "wandb_watch", False))
+        # Use c.get() — getattr() only catches AttributeError but wandb raises wandb.Error
+        freeze_policy   = c.get("freeze_policy",    "last_block")
+        max_samples     = c.get("max_train_samples", None)
+        wd              = float(c.get("weight_decay",   0.0001))
+        watch           = bool(c.get("wandb_watch",     False))
+        optimizer_type  = c.get("optimizer_type",   "sgd")
+        scheduler_type  = c.get("scheduler_type",   "cosine")
+        label_smoothing = float(c.get("label_smoothing", 0.1))
+        strong_augment  = bool(c.get("strong_augment",  True))
         _, history = finetune_train(
             epochs=int(c.epochs),
             lr_head=float(c.lr_head),
             lr_backbone=float(c.lr_backbone),
             freeze_policy=str(freeze_policy),
+            optimizer_type=optimizer_type,
+            scheduler_type=scheduler_type,
+            label_smoothing=label_smoothing,
+            strong_augment=strong_augment,
             device=device,
             use_wandb=True,
             max_train_samples=max_samples,
             weight_decay=wd,
             wandb_reset=False,
-            wandb_finish=True,
+            wandb_finish=False,  # we finish below, after writing summary
             wandb_watch=watch,
         )
         te = history["test_acc"][-1]
         wandb.summary["final_test_accuracy"] = te
+        wandb.finish()
         return history
 
     return train

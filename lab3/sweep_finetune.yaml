@@ -6,7 +6,7 @@
 #   cfg = yaml.safe_load(Path("sweep_finetune.yaml").read_text())
 #   sweep_id = wandb.sweep(cfg, project="lab3-oxford-pets")
 #   train = lab3_pets.run_wandb_sweep_train_fn()
-#   wandb.agent(sweep_id, function=train, count=10)
+#   wandb.agent(sweep_id, function=train, count=12)
 #
 method: random
 metric:
@@ -16,10 +16,18 @@ parameters:
   epochs:
     values: [10, 15]
   lr_head:
-    values: [0.001, 0.01, 0.02]
+    values: [0.001, 0.005, 0.01]
   lr_backbone:
-    values: [0.0001, 0.0003, 0.001]
+    values: [0.00005, 0.0001, 0.0005]
   freeze_policy:
-    values: ["head_only", "last_block", "all"]
+    values: ["head_only", "last_block", "two_blocks", "all"]
+  optimizer_type:
+    values: ["sgd", "adamw"]
+  scheduler_type:
+    values: ["cosine", "exp"]
   weight_decay:
-    values: [0.0, 0.0001]
+    values: [0.0001, 0.001]
+  label_smoothing:
+    values: [0.0, 0.1]
+  strong_augment:
+    values: [true, false]
